@@ -1,41 +1,184 @@
-// Copyright (c) 2012-2017, The CryptoNote developers, The Bytecoin developers
-//
-// This file is part of Bytecoin.
-//
-// Bytecoin is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// Bytecoin is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with Bytecoin.  If not, see <http://www.gnu.org/licenses/>.
+// Copyright (c) 2014-2017, The Monero Project
+// 
+// All rights reserved.
+// 
+// Redistribution and use in source and binary forms, with or without modification, are
+// permitted provided that the following conditions are met:
+// 
+// 1. Redistributions of source code must retain the above copyright notice, this list of
+//    conditions and the following disclaimer.
+// 
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list
+//    of conditions and the following disclaimer in the documentation and/or other
+//    materials provided with the distribution.
+// 
+// 3. Neither the name of the copyright holder nor the names of its contributors may be
+//    used to endorse or promote products derived from this software without specific
+//    prior written permission.
+// 
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+// THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+// THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// 
+// Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
-#include "Util.h"
 #include <cstdio>
 
-#include <boost/filesystem.hpp>
+#ifdef __GLIBC__
+#include <gnu/libc-version.h>
+#endif
 
-#include "CryptoNoteConfig.h"
+#include "include_base_utils.h"
+#include "file_io_utils.h"
+#include "wipeable_string.h"
+using namespace epee;
+
+#include "util.h"
+#include "memwipe.h"
+#include "cryptonote_config.h"
+#include "net/http_client.h"                        // epee::net_utils::...
 
 #ifdef WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <shlobj.h>
-#include <strsafe.h>
+  #include <windows.h>
+  #include <shlobj.h>
+  #include <strsafe.h>
 #else 
-#include <sys/utsname.h>
+  #include <sys/file.h>
+  #include <sys/utsname.h>
+  #include <sys/stat.h>
 #endif
+#include <boost/filesystem.hpp>
+#include <boost/asio.hpp>
+#include <openssl/sha.h>
 
-
-namespace Tools
+namespace tools
 {
+  std::function<void(int)> signal_handler::m_handler;
+
+  private_file::private_file() noexcept : m_handle(), m_filename() {}
+
+  private_file::private_file(std::FILE* handle, std::string&& filename) noexcept
+    : m_handle(handle), m_filename(std::move(filename)) {}
+
+  private_file private_file::create(std::string name)
+  {
+#ifdef WIN32
+    struct close_handle
+    {
+      void operator()(HANDLE handle) const noexcept
+      {
+        CloseHandle(handle);
+      }
+    };
+
+    std::unique_ptr<void, close_handle> process = nullptr;
+    {
+      HANDLE temp{};
+      const bool fail = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, std::addressof(temp)) == 0;
+      process.reset(temp);
+      if (fail)
+        return {};
+    }
+
+    DWORD sid_size = 0;
+    GetTokenInformation(process.get(), TokenOwner, nullptr, 0, std::addressof(sid_size));
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+      return {};
+
+    std::unique_ptr<char[]> sid{new char[sid_size]};
+    if (!GetTokenInformation(process.get(), TokenOwner, sid.get(), sid_size, std::addressof(sid_size)))
+      return {};
+
+    const PSID psid = reinterpret_cast<const PTOKEN_OWNER>(sid.get())->Owner;
+    const DWORD daclSize =
+      sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(psid) - sizeof(DWORD);
+
+    const std::unique_ptr<char[]> dacl{new char[daclSize]};
+    if (!InitializeAcl(reinterpret_cast<PACL>(dacl.get()), daclSize, ACL_REVISION))
+      return {};
+
+    if (!AddAccessAllowedAce(reinterpret_cast<PACL>(dacl.get()), ACL_REVISION, (READ_CONTROL | FILE_GENERIC_READ | DELETE), psid))
+      return {};
+
+    SECURITY_DESCRIPTOR descriptor{};
+    if (!InitializeSecurityDescriptor(std::addressof(descriptor), SECURITY_DESCRIPTOR_REVISION))
+      return {};
+
+    if (!SetSecurityDescriptorDacl(std::addressof(descriptor), true, reinterpret_cast<PACL>(dacl.get()), false))
+      return {};
+
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), std::addressof(descriptor), false};
+    std::unique_ptr<void, close_handle> file{
+      CreateFile(
+        name.c_str(),
+        GENERIC_WRITE, FILE_SHARE_READ,
+        std::addressof(attributes),
+        CREATE_NEW, (FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE),
+        nullptr
+      )
+    };
+    if (file)
+    {
+      const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(file.get()), 0);
+      if (0 <= fd)
+      {
+        file.release();
+        std::FILE* real_file = _fdopen(fd, "w");
+        if (!real_file)
+        {
+          _close(fd);
+        }
+        return {real_file, std::move(name)};
+      }
+    }
+#else
+    const int fdr = open(name.c_str(), (O_RDONLY | O_CREAT), S_IRUSR);
+    if (0 <= fdr)
+    {
+      struct stat rstats = {};
+      if (fstat(fdr, std::addressof(rstats)) != 0)
+      {
+        close(fdr);
+        return {};
+      }
+      fchmod(fdr, (S_IRUSR | S_IWUSR));
+      const int fdw = open(name.c_str(), O_RDWR);
+      fchmod(fdr, rstats.st_mode);
+      close(fdr);
+
+      if (0 <= fdw)
+      {
+        struct stat wstats = {};
+        if (fstat(fdw, std::addressof(wstats)) == 0 &&
+            rstats.st_dev == wstats.st_dev && rstats.st_ino == wstats.st_ino &&
+            flock(fdw, (LOCK_EX | LOCK_NB)) == 0 && ftruncate(fdw, 0) == 0)
+        {
+          std::FILE* file = fdopen(fdw, "w");
+          if (file) return {file, std::move(name)};
+        }
+        close(fdw);
+      }
+    }
+#endif
+    return {};
+  }
+
+  private_file::~private_file() noexcept
+  {
+    try
+    {
+      boost::system::error_code ec{};
+      boost::filesystem::remove(filename(), ec);
+    }
+    catch (...) {}
+  }
+
 #ifdef WIN32
   std::string get_windows_version_display_string()
   {
@@ -264,7 +407,7 @@ namespace Tools
 #else
 std::string get_nix_version_display_string()
 {
-  utsname un;
+  struct utsname un;
 
   if(uname(&un) < 0)
     return std::string("*nix: failed to get os version");
@@ -291,25 +434,29 @@ std::string get_nix_version_display_string()
     namespace fs = boost::filesystem;
     char psz_path[MAX_PATH] = "";
 
-    if(SHGetSpecialFolderPathA(NULL, psz_path, nfolder, iscreate)) {
+    if(SHGetSpecialFolderPathA(NULL, psz_path, nfolder, iscreate))
+    {
       return psz_path;
     }
 
+    LOG_ERROR("SHGetSpecialFolderPathA() failed, could not obtain requested path.");
     return "";
   }
 #endif
-
-  std::string getDefaultDataDirectory()
+  
+  std::string get_default_data_dir()
   {
-    //namespace fs = boost::filesystem;
+    /* Please for the love of god refactor  the ifdefs out of this */
+
+    // namespace fs = boost::filesystem;
     // Windows < Vista: C:\Documents and Settings\Username\Application Data\CRYPTONOTE_NAME
     // Windows >= Vista: C:\Users\Username\AppData\Roaming\CRYPTONOTE_NAME
     // Mac: ~/Library/Application Support/CRYPTONOTE_NAME
     // Unix: ~/.CRYPTONOTE_NAME
     std::string config_folder;
+
 #ifdef WIN32
-    // Windows
-    config_folder = get_special_folder_path(CSIDL_APPDATA, true) + "/" + CryptoNote::CRYPTONOTE_NAME;
+    config_folder = get_special_folder_path(CSIDL_COMMON_APPDATA, true) + "\\" + CRYPTONOTE_NAME;
 #else
     std::string pathRet;
     char* pszHome = getenv("HOME");
@@ -320,31 +467,14 @@ std::string get_nix_version_display_string()
 #ifdef MAC_OSX
     // Mac
     pathRet /= "Library/Application Support";
-    config_folder =  (pathRet + "/" + CryptoNote::CRYPTONOTE_NAME);
+    config_folder =  (pathRet + "/" + CRYPTONOTE_NAME);
 #else
     // Unix
-    config_folder = (pathRet + "/." + CryptoNote::CRYPTONOTE_NAME);
+    config_folder = (pathRet + "/." + CRYPTONOTE_NAME);
 #endif
 #endif
 
     return config_folder;
-  }
-
-  std::string getDefaultCacheFile(const std::string& dataDir) {
-    static const std::string name = "cache_file";
-
-    namespace bf = boost::filesystem;
-    bf::path dir = dataDir;
-
-    if (!bf::exists(dir) ) {
-      throw std::runtime_error("Directory \"" + dir.string() + "\" doesn't exist");
-    }
-
-    if (!bf::exists(dir/name)) {
-      throw std::runtime_error("File \"" + boost::filesystem::path(dir/name).string() + "\" doesn't exist");
-    }
-
-    return boost::filesystem::path(dir/name).string();
   }
 
   bool create_directories_if_necessary(const std::string& path)
@@ -352,11 +482,22 @@ std::string get_nix_version_display_string()
     namespace fs = boost::filesystem;
     boost::system::error_code ec;
     fs::path fs_path(path);
-    if (fs::is_directory(fs_path, ec)) {
+    if (fs::is_directory(fs_path, ec))
+    {
       return true;
     }
 
-    return fs::create_directories(fs_path, ec);
+    bool res = fs::create_directories(fs_path, ec);
+    if (res)
+    {
+      LOG_PRINT_L2("Created directory: " << path);
+    }
+    else
+    {
+      LOG_PRINT_L2("Can't create directory: " << path << ", err: "<< ec.message());
+    }
+
+    return res;
   }
 
   std::error_code replace_file(const std::string& replacement_name, const std::string& replaced_name)
@@ -379,9 +520,176 @@ std::string get_nix_version_display_string()
     return std::error_code(code, std::system_category());
   }
 
-  bool directoryExists(const std::string& path) {
-    boost::system::error_code ec;
-    return boost::filesystem::is_directory(path, ec);
+  bool sanitize_locale()
+  {
+    // boost::filesystem throws for "invalid" locales, such as en_US.UTF-8, or kjsdkfs,
+    // so reset it here before any calls to it
+    try
+    {
+      boost::filesystem::path p {std::string("test")};
+      p /= std::string("test");
+    }
+    catch (...)
+    {
+#if defined(__MINGW32__) || defined(__MINGW__)
+      putenv("LC_ALL=C");
+      putenv("LANG=C");
+#else
+      setenv("LC_ALL", "C", 1);
+      setenv("LANG", "C", 1);
+#endif
+      return true;
+    }
+    return false;
+  }
+  bool on_startup()
+  {
+    wipeable_string::set_wipe(&memwipe);
+
+    mlog_configure("", true);
+
+    sanitize_locale();
+
+#ifdef __GLIBC__
+    const char *ver = gnu_get_libc_version();
+    if (!strcmp(ver, "2.25"))
+      MCLOG_RED(el::Level::Warning, "global", "Running with glibc " << ver << ", hangs may occur - change glibc version if possible");
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000 || defined(LIBRESSL_VERSION_TEXT)
+    SSL_library_init();
+#else
+    OPENSSL_init_ssl(0, NULL);
+#endif
+
+    return true;
+  }
+  void set_strict_default_file_permissions(bool strict)
+  {
+#if defined(__MINGW32__) || defined(__MINGW__)
+    // no clue about the odd one out
+#else
+    mode_t mode = strict ? 077 : 0;
+    umask(mode);
+#endif
   }
 
+  namespace
+  {
+    boost::mutex max_concurrency_lock;
+    unsigned max_concurrency = boost::thread::hardware_concurrency();
+  }
+
+  void set_max_concurrency(unsigned n)
+  {
+    if (n < 1)
+      n = boost::thread::hardware_concurrency();
+    unsigned hwc = boost::thread::hardware_concurrency();
+    if (n > hwc)
+      n = hwc;
+    boost::lock_guard<boost::mutex> lock(max_concurrency_lock);
+    max_concurrency = n;
+  }
+
+  unsigned get_max_concurrency()
+  {
+    boost::lock_guard<boost::mutex> lock(max_concurrency_lock);
+    return max_concurrency;
+  }
+
+  bool is_local_address(const std::string &address)
+  {
+    // extract host
+    epee::net_utils::http::url_content u_c;
+    if (!epee::net_utils::parse_url(address, u_c))
+    {
+      MWARNING("Failed to determine whether address '" << address << "' is local, assuming not");
+      return false;
+    }
+    if (u_c.host.empty())
+    {
+      MWARNING("Failed to determine whether address '" << address << "' is local, assuming not");
+      return false;
+    }
+
+    // resolve to IP
+    boost::asio::io_service io_service;
+    boost::asio::ip::tcp::resolver resolver(io_service);
+    boost::asio::ip::tcp::resolver::query query(u_c.host, "");
+    boost::asio::ip::tcp::resolver::iterator i = resolver.resolve(query);
+    while (i != boost::asio::ip::tcp::resolver::iterator())
+    {
+      const boost::asio::ip::tcp::endpoint &ep = *i;
+      if (ep.address().is_loopback())
+      {
+        MDEBUG("Address '" << address << "' is local");
+        return true;
+      }
+      ++i;
+    }
+
+    MDEBUG("Address '" << address << "' is not local");
+    return false;
+  }
+  int vercmp(const char *v0, const char *v1)
+  {
+    std::vector<std::string> f0, f1;
+    boost::split(f0, v0, boost::is_any_of("."));
+    boost::split(f1, v1, boost::is_any_of("."));
+    while (f0.size() < f1.size())
+      f0.push_back("0");
+    while (f1.size() < f0.size())
+      f1.push_back("0");
+    for (size_t i = 0; i < f0.size(); ++i) {
+      int f0i = atoi(f0[i].c_str()), f1i = atoi(f1[i].c_str());
+      int n = f0i - f1i;
+      if (n)
+        return n;
+    }
+    return 0;
+  }
+
+  bool sha256sum(const uint8_t *data, size_t len, crypto::hash &hash)
+  {
+    SHA256_CTX ctx;
+    if (!SHA256_Init(&ctx))
+      return false;
+    if (!SHA256_Update(&ctx, data, len))
+      return false;
+    if (!SHA256_Final((unsigned char*)hash.data, &ctx))
+      return false;
+    return true;
+  }
+
+  bool sha256sum(const std::string &filename, crypto::hash &hash)
+  {
+    if (!epee::file_io_utils::is_file_exist(filename))
+      return false;
+    std::ifstream f;
+    f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    f.open(filename, std::ios_base::binary | std::ios_base::in | std::ios::ate);
+    if (!f)
+      return false;
+    std::ifstream::pos_type file_size = f.tellg();
+    SHA256_CTX ctx;
+    if (!SHA256_Init(&ctx))
+      return false;
+    size_t size_left = file_size;
+    f.seekg(0, std::ios::beg);
+    while (size_left)
+    {
+      char buf[4096];
+      std::ifstream::pos_type read_size = size_left > sizeof(buf) ? sizeof(buf) : size_left;
+      f.read(buf, read_size);
+      if (!f || !f.good())
+        return false;
+      if (!SHA256_Update(&ctx, buf, read_size))
+        return false;
+      size_left -= read_size;
+    }
+    f.close();
+    if (!SHA256_Final((unsigned char*)hash.data, &ctx))
+      return false;
+    return true;
+  }
 }
